@@ -1,7 +1,6 @@
 import os
 import re
 import requests
-import sys
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,15 +18,18 @@ app.add_middleware(
 )
 
 # Configuration
-DB_FILE = "organized_students.txt"
-SECRET_SYNC_KEY = "SHADOW_SYNC_2026"  # Use this in UptimeRobot
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "organized_students.txt")
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+SECRET_SYNC_KEY = "SHADOW_SYNC_2026"
 BASE_URL = "https://ccsjdm.com/student_portal/gs"
 
-# 1. Mount the static folder (Ensures CSS/JS in index.html work)
-# Note: Create a 'static' folder and put your index.html inside it.
-if not os.path.exists("static"):
-    os.makedirs("static")
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# Ensure static directory exists
+if not os.path.exists(STATIC_DIR):
+    os.makedirs(STATIC_DIR)
+
+# Mount the static folder using absolute path
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 def get_portal_session():
     """Bypasses portal login using SQLi and returns a session."""
@@ -55,13 +57,14 @@ def sync_students_task():
     print("[*] Starting full student directory sync...")
     master_list = []
     
+    # Iterate through alphabet to collect all students
     for char in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
         try:
             search_url = f"{BASE_URL}/admin-portal/view_students.php?search={char}"
             resp = session.get(search_url, timeout=20)
             soup = BeautifulSoup(resp.text, 'html.parser')
-            
             rows = soup.find_all('tr', class_='hover:bg-gray-50')
+            
             for row in rows:
                 cols = row.find_all('td')
                 if len(cols) >= 4:
@@ -83,8 +86,11 @@ def sync_students_task():
 
 @app.get("/", response_class=FileResponse)
 async def read_index():
-    """Serves the frontend UI"""
-    return "static/index.html"
+    """Serves the frontend UI using an absolute path."""
+    index_path = os.path.join(STATIC_DIR, "index.html")
+    if os.path.exists(index_path):
+        return index_path
+    return JSONResponse({"error": "index.html not found in static folder"}, status_code=404)
 
 @app.get("/api/status")
 async def system_status():
@@ -100,7 +106,6 @@ async def trigger_sync(background_tasks: BackgroundTasks, key: str = None):
     """Endpoint for UptimeRobot to trigger the daily crawl."""
     if key != SECRET_SYNC_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized: Invalid Secret Key")
-    
     background_tasks.add_task(sync_students_task)
     return {"message": "Sync sequence initiated in background."}
 
@@ -113,8 +118,9 @@ async def search_students(q: str = Query(..., min_length=2)):
     query = q.upper()
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
+            # Efficient streaming search
             matches = [line.strip() for line in f if query in line.upper()]
-        return {"results": matches[:20]}
+            return {"results": matches[:20]}
     except Exception as e:
         return {"results": [], "error": str(e)}
 
@@ -129,7 +135,6 @@ async def get_grades(student_id: str):
     try:
         resp = session.get(target_url, timeout=15)
         soup = BeautifulSoup(resp.text, 'html.parser')
-        
         tables = soup.find_all('table')
         transcript = []
 
@@ -152,9 +157,6 @@ async def get_grades(student_id: str):
             for row in rows:
                 code = row.select_one('.subject-code').get_text(strip=True)
                 desc = row.select_one('.subject-desc').get_text(strip=True)
-                prof_div = row.find('div', string=re.compile(r'Prof\.'))
-                instructor = prof_div.get_text(strip=True).replace("Prof. ", "") if prof_div else "Staff"
-                
                 cols = row.find_all('td')
                 mid = cols[2].get_text(strip=True) if len(cols) > 2 else "-"
                 fin = cols[3].get_text(strip=True) if len(cols) > 3 else "-"
@@ -164,7 +166,6 @@ async def get_grades(student_id: str):
                 sem_info["subjects"].append({
                     "code": code,
                     "description": desc,
-                    "instructor": instructor,
                     "midterm": mid,
                     "final": fin,
                     "grade": final_grade
@@ -175,14 +176,12 @@ async def get_grades(student_id: str):
                 sem_info["gwa"] = gwa_row.find_all('td')[-1].get_text(strip=True)
 
             transcript.append(sem_info)
-
+        
         return {"student_id": student_id, "transcript": transcript}
-    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
-    # Get port from environment or default to 8000
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
