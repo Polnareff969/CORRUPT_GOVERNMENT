@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <title>Shadow Engine | Intelligence</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #09090b; color: #fafafa; }
+        .glass { background: rgba(18, 18, 21, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.05); }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 10px; }
+    </style>
+</head>
+<body class="min-h-screen p-4 md:p-8">
+
+    <div class="max-w-5xl mx-auto">
+        <header class="flex items-center justify-between mb-12 px-2">
+            <div class="flex items-center gap-5">
+                <img src="/static/logo.jpg" alt="Logo" class="w-11 h-11 rounded-xl object-cover border border-zinc-800 shadow-xl">
+                <div class="flex flex-col">
+                    <h1 class="text-xl font-bold tracking-tight text-white leading-none">Shadow Engine</h1>
+                    <div class="flex items-center gap-2 mt-1.5">
+                        <div class="relative flex h-2 w-2">
+                            <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-zinc-400 opacity-20"></span>
+                            <span class="relative inline-flex rounded-full h-2 w-2 bg-zinc-600"></span>
+                        </div>
+                        <span class="text-[10px] text-zinc-500 uppercase tracking-[0.15em] font-bold" id="status-text">Connecting</span>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <div class="grid grid-cols-1 lg:grid-cols-12 gap-8">
+            <div class="lg:col-span-4 space-y-4">
+                <div class="relative">
+                    <input type="text" id="search-input" placeholder="Search student name..." 
+                           class="w-full bg-zinc-900 border border-zinc-800 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-zinc-600 transition-all">
+                </div>
+                
+                <div id="results-list" class="space-y-2 overflow-y-auto max-h-[60vh]">
+                    </div>
+            </div>
+
+            <div class="lg:col-span-8">
+                <div id="details-pane" class="glass rounded-2xl p-6 min-h-[400px] flex flex-col items-center justify-center text-zinc-600">
+                    <p>Select a student to view academic records</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const statusText = document.getElementById('status-text');
+        const searchInput = document.getElementById('search-input');
+        const resultsList = document.getElementById('results-list');
+        const detailsPane = document.getElementById('details-pane');
+
+        // Check System Status
+        async function checkStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                if(data.db_initialized) {
+                    statusText.innerText = "Local DB Online";
+                    statusText.classList.replace('text-zinc-500', 'text-emerald-500');
+                }
+            } catch (e) { statusText.innerText = "Offline"; }
+        }
+
+        // Search Logic
+        searchInput.addEventListener('input', async (e) => {
+            const query = e.target.value;
+            if(query.length < 2) return;
+            
+            const res = await fetch(`/api/search?q=${query}`);
+            const data = await res.json();
+            
+            resultsList.innerHTML = '';
+            data.results.forEach(str => {
+                const parts = str.split(',');
+                const sid = parts[0].split(':')[1];
+                const name = parts[1].split(':')[1];
+                
+                const btn = document.createElement('button');
+                btn.className = "w-full text-left p-4 rounded-xl bg-zinc-900/50 hover:bg-zinc-800 border border-zinc-800/50 transition-all group";
+                btn.innerHTML = `<div class="text-xs text-zinc-500 mb-1">${sid}</div><div class="text-sm font-semibold group-hover:text-white">${name}</div>`;
+                btn.onclick = () => loadGrades(sid, name);
+                resultsList.appendChild(btn);
+            });
+        });
+
+        // Load Grades Logic
+        async function loadGrades(sid, name) {
+            detailsPane.innerHTML = '<div class="animate-pulse">Retrieving encrypted records...</div>';
+            const res = await fetch(`/api/grades/${sid}`);
+            const data = await res.json();
+            
+            let html = `<div class="w-full"><h2 class="text-2xl font-bold mb-1">${name}</h2><p class="text-zinc-500 text-sm mb-8">${sid}</p>`;
+            
+            data.transcript.forEach(sem => {
+                html += `<div class="mb-8"><h3 class="text-zinc-400 text-xs uppercase tracking-widest font-bold mb-4">${sem.term}</h3>
+                         <div class="space-y-3">`;
+                sem.subjects.forEach(sub => {
+                    html += `<div class="flex justify-between items-center p-3 rounded-lg bg-zinc-900/30 border border-zinc-800/30">
+                                <div><div class="text-sm font-medium">${sub.description}</div><div class="text-[10px] text-zinc-500">${sub.code}</div></div>
+                                <div class="text-lg font-bold ${parseFloat(sub.grade) <= 3.0 ? 'text-emerald-400' : 'text-rose-400'}">${sub.grade}</div>
+                             </div>`;
+                });
+                html += `</div></div>`;
+            });
+            html += `</div>`;
+            detailsPane.innerHTML = html;
+        }
+
+        checkStatus();
+    </script>
+</body>
+</html>
