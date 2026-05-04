@@ -1,49 +1,43 @@
 import os
 import re
-import asyncio
-import httpx
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from bs4 import BeautifulSoup
+import httpx
 
 app = FastAPI()
 
-# FIX 1: Serve the static folder for your logo.jpg
+# Mount static for logo.jpg
 if os.path.exists("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
 DB_FILE = "students.txt"
 PORTAL_IP = "82.25.125.30"
 SESSION_ID = "a91h1f0n33i73qucmloitsauc5"
-STUDENT_CACHE = []
 
-def parse_student_dump():
-    global STUDENT_CACHE
+def get_student_data():
+    """Reads and parses the manual students.txt file."""
     if not os.path.exists(DB_FILE):
-        print("Waiting for sync: students.txt not found.")
-        return
+        return []
     
     with open(DB_FILE, "r") as f:
-        data = f.read()
-    
-    # Improved regex to handle the leading '[' and raw format
-    pattern = r"studentID:(.*?),name:(.*?),cys:(.*?),status:(.*?)(?=\n|studentID:|$)"
-    matches = re.findall(pattern, data)
-    
-    STUDENT_CACHE = []
-    for m in matches:
-        STUDENT_CACHE.append({
-            "id": m[0].strip().replace("[", ""), # Clean up leading bracket if any
-            "name": m[1].strip(),
-            "cys": m[2].strip(),
-            "status": m[3].strip()
-        })
-    print(f"Cache updated: {len(STUDENT_CACHE)} students loaded.")
+        content = f.read()
 
-@app.on_event("startup")
-async def startup():
-    parse_student_dump()
+    # Hardened Regex to handle the '[' at the start and the specific comma-separated pairs
+    # Matches: studentID:2025-96-0187,name:JAYSON, LHAIZA DAYOLA,cys:BPA 1D,status:REGULAR
+    pattern = r"studentID:(?P<id>.*?),name:(?P<name>.*?),cys:(?P<cys>.*?),status:(?P<status>.*?)(?=\n|studentID:|$)"
+    
+    results = []
+    for match in re.finditer(pattern, content):
+        sid = match.group("id").strip().replace("[", "") # Clean the initial bracket
+        results.append({
+            "id": sid,
+            "name": match.group("name").strip(),
+            "cys": match.group("cys").strip(),
+            "status": match.group("status").strip()
+        })
+    return results
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
@@ -52,52 +46,53 @@ async def serve_index():
 @app.get("/api/search")
 async def search(q: str = ""):
     query = q.upper()
-    # Search ID, Name, or Course
-    return [s for s in STUDENT_CACHE if query in s['name'] or query in s['id'] or query in s['cys']][:26]
-
-@app.post("/api/sync")
-async def sync_db(background_tasks: BackgroundTasks):
-    async def do_sync():
-        url = f"https://{PORTAL_IP}/gs/admin-portal/AjaxPHPfiles/students.php?allStudentData=true&buttonSelected=overall"
-        headers = {"Host": "sb.ccsjdm.com", "User-Agent": "Mozilla/6.0"}
-        cookies = {"PHPSESSID": SESSION_ID}
-        async with httpx.AsyncClient(verify=False) as client:
-            try:
-                r = await client.get(url, headers=headers, cookies=cookies, timeout=12.0)
-                if r.status_code == 200:
-                    with open(DB_FILE, "w") as f:
-                        f.write(r.text)
-                    parse_student_dump()
-            except Exception as e:
-                print(f"Sync Error: {e}")
-    background_tasks.add_task(do_sync)
-    return {"message": "Syncing"}
+    all_students = get_student_data()
+    
+    # Search across Name, ID, and Course
+    matches = [
+        s for s in all_students 
+        if query in s['name'].upper() or query in s['id'] or query in s['cys'].upper()
+    ]
+    return matches[:26]
 
 @app.get("/api/grades/{sid}")
 async def get_grades(sid: str):
     url = f"https://{PORTAL_IP}/gs/admin-portal/view_student_grades.php?id={sid}"
     headers = {"Host": "sb.ccsjdm.com"}
     cookies = {"PHPSESSID": SESSION_ID}
+    
     async with httpx.AsyncClient(verify=False) as client:
-        r = await client.get(url, headers=headers, cookies=cookies, timeout=12.0)
-        soup = BeautifulSoup(r.text, 'html.parser')
-        results = []
-        for table in soup.find_all('table'):
-            caption = table.find('caption')
-            semester = caption.get_text(strip=True) if caption else "Semester Data"
-            year = table.find_previous('h2').get_text(strip=True) if table.find_previous('h2') else ""
-            subjects = []
-            for row in table.find_all('tr', class_='bg-white border'):
-                cols = row.find_all(['th', 'td'])
-                if len(cols) >= 7:
-                    subjects.append({
-                        "code": cols[0].get_text(strip=True),
-                        "desc": cols[1].get_text(strip=True),
-                        "prof": cols[3].get_text(strip=True),
-                        "mid": cols[4].get_text(strip=True), 
-                        "fin": cols[5].get_text(strip=True),
-                        "gwa": cols[6].get_text(strip=True)
-                    })
-                elif "Total Final Grade" in row.get_text():
-                    results.append({"year": year, "semester": semester, "data": subjects, "total_gwa": cols[-1].get_text(strip=True)})
-        return results
+        try:
+            r = await client.get(url, headers=headers, cookies=cookies, timeout=12.0)
+            soup = BeautifulSoup(r.text, 'html.parser')
+            results = []
+            
+            for table in soup.find_all('table'):
+                caption = table.find('caption')
+                semester = caption.get_text(strip=True) if caption else "Academic Term"
+                year_tag = table.find_previous('h2')
+                year = year_tag.get_text(strip=True) if year_tag else ""
+                
+                subjects = []
+                # Matches the specific row classes in the portal
+                for row in table.find_all('tr', class_='bg-white border'):
+                    cols = row.find_all(['td', 'th'])
+                    if len(cols) >= 7:
+                        subjects.append({
+                            "code": cols[0].get_text(strip=True),
+                            "desc": cols[1].get_text(strip=True),
+                            "prof": cols[3].get_text(strip=True),
+                            "mid": cols[4].get_text(strip=True),
+                            "fin": cols[5].get_text(strip=True),
+                            "gwa": cols[6].get_text(strip=True)
+                        })
+                
+                if subjects:
+                    # Find total GWA in the footer row
+                    footer = table.find('tr', class_='bg-slate-200')
+                    total = footer.find_all('td')[-1].get_text(strip=True) if footer else "N/A"
+                    results.append({"year": year, "semester": semester, "data": subjects, "total_gwa": total})
+            
+            return results
+        except Exception:
+            return []
