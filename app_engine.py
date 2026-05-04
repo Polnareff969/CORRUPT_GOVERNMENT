@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 
 app = FastAPI()
 
-# Mount the static folder so /static/logo.jpg works
+# FIX 1: Serve the static folder for your logo.jpg
 if os.path.exists("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
@@ -21,22 +21,25 @@ STUDENT_CACHE = []
 def parse_student_dump():
     global STUDENT_CACHE
     if not os.path.exists(DB_FILE):
+        print("Waiting for sync: students.txt not found.")
         return
+    
     with open(DB_FILE, "r") as f:
         data = f.read()
     
-    # Precise regex for: studentID:2025-xx,name:SURNAME, FIRSTNAME,cys:BSCRIM,status:REGULAR
+    # Improved regex to handle the leading '[' and raw format
     pattern = r"studentID:(.*?),name:(.*?),cys:(.*?),status:(.*?)(?=\n|studentID:|$)"
     matches = re.findall(pattern, data)
     
     STUDENT_CACHE = []
     for m in matches:
         STUDENT_CACHE.append({
-            "id": m[0].strip(),
+            "id": m[0].strip().replace("[", ""), # Clean up leading bracket if any
             "name": m[1].strip(),
             "cys": m[2].strip(),
             "status": m[3].strip()
         })
+    print(f"Cache updated: {len(STUDENT_CACHE)} students loaded.")
 
 @app.on_event("startup")
 async def startup():
@@ -49,9 +52,8 @@ async def serve_index():
 @app.get("/api/search")
 async def search(q: str = ""):
     query = q.upper()
-    # Search across ID, Name, and Course/Year/Section
-    results = [s for s in STUDENT_CACHE if query in s['name'] or query in s['id'] or query in s['cys']]
-    return results[:26]
+    # Search ID, Name, or Course
+    return [s for s in STUDENT_CACHE if query in s['name'] or query in s['id'] or query in s['cys']][:26]
 
 @app.post("/api/sync")
 async def sync_db(background_tasks: BackgroundTasks):
@@ -61,12 +63,13 @@ async def sync_db(background_tasks: BackgroundTasks):
         cookies = {"PHPSESSID": SESSION_ID}
         async with httpx.AsyncClient(verify=False) as client:
             try:
-                r = await client.get(url, headers=headers, cookies=cookies, timeout=6.0)
+                r = await client.get(url, headers=headers, cookies=cookies, timeout=12.0)
                 if r.status_code == 200:
                     with open(DB_FILE, "w") as f:
                         f.write(r.text)
                     parse_student_dump()
-            except Exception: pass
+            except Exception as e:
+                print(f"Sync Error: {e}")
     background_tasks.add_task(do_sync)
     return {"message": "Syncing"}
 
@@ -76,18 +79,15 @@ async def get_grades(sid: str):
     headers = {"Host": "sb.ccsjdm.com"}
     cookies = {"PHPSESSID": SESSION_ID}
     async with httpx.AsyncClient(verify=False) as client:
-        r = await client.get(url, headers=headers, cookies=cookies, timeout=6.0)
+        r = await client.get(url, headers=headers, cookies=cookies, timeout=12.0)
         soup = BeautifulSoup(r.text, 'html.parser')
         results = []
-        tables = soup.find_all('table')
-        for table in tables:
+        for table in soup.find_all('table'):
             caption = table.find('caption')
             semester = caption.get_text(strip=True) if caption else "Semester Data"
-            year_header = table.find_previous('h2')
-            year = year_header.get_text(strip=True) if year_header else ""
+            year = table.find_previous('h2').get_text(strip=True) if table.find_previous('h2') else ""
             subjects = []
-            rows = table.find_all('tr', class_='bg-white border')
-            for row in rows:
+            for row in table.find_all('tr', class_='bg-white border'):
                 cols = row.find_all(['th', 'td'])
                 if len(cols) >= 7:
                     subjects.append({
